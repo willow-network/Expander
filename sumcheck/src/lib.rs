@@ -20,3 +20,6 @@ pub mod cuda_ffi;
 
 #[cfg(feature = "cuda")]
 pub mod cuda_dispatch;
+
+pub mod sumcheck_batch;
+pub use sumcheck_batch::*;
