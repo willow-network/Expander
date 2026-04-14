@@ -5,9 +5,9 @@
 
 #[cfg(feature = "cuda")]
 use crate::cuda_ffi;
+use crate::Node;
 #[cfg(feature = "cuda")]
 use crate::LEAF_HASH_BYTES;
-use crate::Node;
 
 /// Minimum number of leaves to dispatch to GPU.
 /// Below this, CPU is faster due to kernel launch + PCIe overhead.

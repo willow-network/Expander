@@ -1,8 +1,8 @@
 use arith::{Field, SimdField};
 use circuit::CircuitLayer;
-use gkr_engine::{ExpanderDualVarChallenge, FieldEngine, MPIEngine};
 #[cfg(feature = "cuda")]
 use gkr_engine::FieldType;
+use gkr_engine::{ExpanderDualVarChallenge, FieldEngine, MPIEngine};
 use polynomials::EqPolynomial;
 
 use crate::{unpack_and_combine, ProverScratchPad};
@@ -139,8 +139,7 @@ impl<'a, F: FieldEngine> SumcheckGkrVanillaHelper<'a, F> {
                 let gpu_ctx = self.gpu_ctx.as_ref().unwrap();
                 if let Some(per_lane) = unsafe { gpu_ctx.poly_eval_at(eval_size) } {
                     let pack_size = F::get_field_pack_size();
-                    let [p0, p1, mut p2] =
-                        gpu_pack_poly_eval_results::<F>(&per_lane, pack_size);
+                    let [p0, p1, mut p2] = gpu_pack_poly_eval_results::<F>(&per_lane, pack_size);
 
                     // Apply the same p2 correction the CPU path does (M31 fields).
                     p2 = p1.mul_by_6() + p0.mul_by_3() - p2.double();
@@ -502,14 +501,9 @@ impl<'a, F: FieldEngine> SumcheckGkrVanillaHelper<'a, F> {
         if let Some(gpu_ctx) = self.gpu_ctx.take() {
             let elems_to_download = current_eval_size * 2;
             unsafe {
-                gpu_ctx.download_bk_f(
-                    self.sp.v_evals.as_mut_ptr() as *mut u32,
-                    elems_to_download,
-                );
-                gpu_ctx.download_bk_hg(
-                    self.sp.hg_evals.as_mut_ptr() as *mut u32,
-                    elems_to_download,
-                );
+                gpu_ctx.download_bk_f(self.sp.v_evals.as_mut_ptr() as *mut u32, elems_to_download);
+                gpu_ctx
+                    .download_bk_hg(self.sp.hg_evals.as_mut_ptr() as *mut u32, elems_to_download);
             }
             // gpu_ctx dropped here → device memory freed.
         }

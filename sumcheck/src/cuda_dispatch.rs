@@ -381,28 +381,13 @@ impl GpuSumcheckContext {
 
         // ---- Upload ----
 
-        if cuda_memcpy_h2d(
-            d_bk_f.ptr() as _,
-            bk_f_aos.as_ptr() as _,
-            ext3_bytes,
-        ) != 0
-        {
+        if cuda_memcpy_h2d(d_bk_f.ptr() as _, bk_f_aos.as_ptr() as _, ext3_bytes) != 0 {
             return None;
         }
-        if cuda_memcpy_h2d(
-            d_bk_hg.ptr() as _,
-            hg_aos.as_ptr() as _,
-            ext3_bytes,
-        ) != 0
-        {
+        if cuda_memcpy_h2d(d_bk_hg.ptr() as _, hg_aos.as_ptr() as _, ext3_bytes) != 0 {
             return None;
         }
-        if cuda_memcpy_h2d(
-            d_init_v.ptr() as _,
-            init_v_aos.as_ptr() as _,
-            base_bytes,
-        ) != 0
-        {
+        if cuda_memcpy_h2d(d_init_v.ptr() as _, init_v_aos.as_ptr() as _, base_bytes) != 0 {
             return None;
         }
 
