@@ -595,3 +595,348 @@ impl Drop for GpuSumcheckContext {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// BatchedGpuSumcheckContext — N independent circuit proves, batched into one
+// kernel dispatch per round. Drop-in extension of GpuSumcheckContext for
+// the cross-instance batching architecture (see Phase 7 / completeness scaling
+// bench). At each layer's poly_eval / receive_challenge, total batch dim is
+// `n_instances * pack_size`, so 256 instances × 16 SIMD lanes = 4096 effective
+// folds in one kernel call. Per-fold cost stays roughly constant across
+// batch-size at small/medium eval_size — see batched_dispatch_scaling bench.
+// ---------------------------------------------------------------------------
+
+/// Cross-instance batched GPU sumcheck context.
+///
+/// Holds N independent circuit witnesses in one mega-buffer and dispatches
+/// every kernel with `batch_size = n_instances * pack_size` and
+/// `fold_stride_u32 = lane_stride_ext3` (one "fold" per SIMD lane, all
+/// stacked contiguously). Each instance's transcript is independent so
+/// each lane group of 16 may receive a different challenge `r` per round;
+/// the kernel takes per-fold challenges, so we replicate each instance's
+/// `r` 16 times (once per pack lane) before upload.
+#[cfg(feature = "cuda")]
+pub struct BatchedGpuSumcheckContext {
+    /// Stacked bookkeeping for f polynomial across N instances.
+    /// Layout: instance_0 [16 lanes × lane_stride_ext3 u32]
+    ///       | instance_1 [16 lanes × lane_stride_ext3 u32]
+    ///       | …
+    d_bk_f: *mut u32,
+    /// Same shape for hg.
+    d_bk_hg: *mut u32,
+    /// Same shape but base field (1 u32 per element per lane).
+    d_init_v: *mut u32,
+    /// Per-lane challenge buffer: `n_instances * pack_size * 3` u32.
+    /// Within an instance, r is replicated across all `pack_size` lanes.
+    d_challenge: *mut u32,
+    /// Per-lane poly_eval result: `n_instances * pack_size * 9` u32.
+    d_result: *mut u32,
+
+    n_instances: usize,
+    pack_size: usize,
+    /// u32 stride per lane segment (same as GpuSumcheckContext).
+    lane_stride_ext3: usize,
+    lane_stride_base: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl BatchedGpuSumcheckContext {
+    /// Allocate device memory for `n_instances` independent provers and
+    /// upload their initial state.
+    ///
+    /// `hg_evals_ptrs[i]` and `init_v_ptrs[i]` point to instance `i`'s
+    /// host data in the same SoA-x16 layout `GpuSumcheckContext::new`
+    /// accepts. All instances must share `pack_size` and `input_size`.
+    ///
+    /// # Safety
+    ///
+    /// Each `hg_evals_ptrs[i]` must point to `input_size` contiguous
+    /// M31Ext3x16 values (`input_size * 48` u32). Each `init_v_ptrs[i]`
+    /// must point to `input_size` contiguous M31x16 values
+    /// (`input_size * 16` u32).
+    pub unsafe fn new(
+        hg_evals_ptrs: &[*const u32],
+        init_v_ptrs: &[*const u32],
+        pack_size: usize,
+        input_size: usize,
+    ) -> Option<Self> {
+        let n_instances = hg_evals_ptrs.len();
+        if n_instances == 0 || init_v_ptrs.len() != n_instances {
+            return None;
+        }
+
+        let lane_stride_ext3 = input_size * 3;
+        let lane_stride_base = input_size;
+
+        let per_instance_ext3_u32 = pack_size * lane_stride_ext3;
+        let per_instance_base_u32 = pack_size * lane_stride_base;
+        let total_ext3_u32 = n_instances * per_instance_ext3_u32;
+        let total_base_u32 = n_instances * per_instance_base_u32;
+
+        let ext3_bytes = total_ext3_u32 * std::mem::size_of::<u32>();
+        let base_bytes = total_base_u32 * std::mem::size_of::<u32>();
+
+        // Build host-side stacked buffers, one instance after another.
+        let mut hg_aos = vec![0u32; total_ext3_u32];
+        let mut bk_f_aos = vec![0u32; total_ext3_u32];
+        let mut init_v_aos = vec![0u32; total_base_u32];
+
+        for i in 0..n_instances {
+            let off_ext3 = i * per_instance_ext3_u32;
+            let off_base = i * per_instance_base_u32;
+            convert_simd_ext3_to_aos(
+                hg_evals_ptrs[i],
+                hg_aos.as_mut_ptr().add(off_ext3),
+                input_size,
+                pack_size,
+            );
+            convert_simd_base_to_promoted_ext3_aos(
+                init_v_ptrs[i],
+                bk_f_aos.as_mut_ptr().add(off_ext3),
+                input_size,
+                pack_size,
+            );
+            convert_simd_base_to_aos(
+                init_v_ptrs[i],
+                init_v_aos.as_mut_ptr().add(off_base),
+                input_size,
+                pack_size,
+            );
+        }
+
+        // Allocate.
+        let d_bk_f = DevicePtr::alloc(ext3_bytes)?;
+        let d_bk_hg = DevicePtr::alloc(ext3_bytes)?;
+        let d_init_v = DevicePtr::alloc(base_bytes)?;
+        let d_challenge = DevicePtr::alloc(n_instances * pack_size * 3 * 4)?;
+        let d_result = DevicePtr::alloc(n_instances * pack_size * 9 * 4)?;
+
+        // Upload.
+        if cuda_memcpy_h2d(d_bk_f.ptr() as _, bk_f_aos.as_ptr() as _, ext3_bytes) != 0 {
+            return None;
+        }
+        if cuda_memcpy_h2d(d_bk_hg.ptr() as _, hg_aos.as_ptr() as _, ext3_bytes) != 0 {
+            return None;
+        }
+        if cuda_memcpy_h2d(d_init_v.ptr() as _, init_v_aos.as_ptr() as _, base_bytes) != 0 {
+            return None;
+        }
+
+        Some(BatchedGpuSumcheckContext {
+            d_bk_f: d_bk_f.into_raw(),
+            d_bk_hg: d_bk_hg.into_raw(),
+            d_init_v: d_init_v.into_raw(),
+            d_challenge: d_challenge.into_raw(),
+            d_result: d_result.into_raw(),
+            n_instances,
+            pack_size,
+            lane_stride_ext3,
+            lane_stride_base,
+        })
+    }
+
+    /// Total kernel batch dimension: `n_instances * pack_size`.
+    pub fn total_batch(&self) -> usize {
+        self.n_instances * self.pack_size
+    }
+
+    pub fn n_instances(&self) -> usize {
+        self.n_instances
+    }
+
+    /// Whether `eval_size` is large enough to benefit from GPU dispatch.
+    pub fn should_use_gpu(&self, eval_size: usize) -> bool {
+        eval_size >= GPU_DISPATCH_THRESHOLD
+    }
+
+    /// Run `poly_eval_at` across all instances in one kernel dispatch.
+    ///
+    /// Returns a flat `Vec<[[u32; 9]; 16]>` of length `n_instances` where
+    /// `result[i][lane]` is `[p0_l0, p0_l1, p0_l2, p1_l0, …, p2_l2]` for
+    /// instance `i`'s SIMD lane `lane`. Bit-exact with calling
+    /// `GpuSumcheckContext::poly_eval_at` once per instance.
+    ///
+    /// # Safety
+    ///
+    /// Device pointers must still be valid (context not dropped).
+    pub unsafe fn poly_eval_at(&self, eval_size: usize) -> Option<Vec<[[u32; 9]; 16]>> {
+        debug_assert!(self.pack_size <= 16);
+
+        let total_batch = self.total_batch();
+        let err = cuda_ffi::cuda_m31ext3_poly_eval_batched(
+            self.d_bk_f as *const u32,
+            self.d_bk_hg as *const u32,
+            self.d_result,
+            eval_size as u32,
+            total_batch as u32,
+            self.lane_stride_ext3 as u32,
+        );
+        if err != 0 {
+            return None;
+        }
+
+        let mut packed = vec![0u32; total_batch * 9];
+        if cuda_memcpy_d2h(
+            packed.as_mut_ptr() as *mut std::ffi::c_void,
+            self.d_result as *const std::ffi::c_void,
+            total_batch * 9 * 4,
+        ) != 0
+        {
+            return None;
+        }
+
+        let mut out = vec![[[0u32; 9]; 16]; self.n_instances];
+        for i in 0..self.n_instances {
+            for lane in 0..self.pack_size {
+                let off = (i * self.pack_size + lane) * 9;
+                out[i][lane].copy_from_slice(&packed[off..off + 9]);
+            }
+        }
+        Some(out)
+    }
+
+    /// Run `receive_challenge` across all instances in one kernel dispatch.
+    ///
+    /// `r_limbs_per_instance[i]` is instance `i`'s scalar challenge for
+    /// this round. Within an instance, r is replicated across all SIMD
+    /// lanes (the lanes share a transcript inside one instance).
+    ///
+    /// First-round (`var_idx == 0`) currently falls back to a per-instance
+    /// loop because the batched kernel doesn't yet have base-field
+    /// `init_v` mode. That happens once per phase out of `log_n` rounds,
+    /// so the bulk of dispatches still benefit from batching.
+    ///
+    /// # Safety
+    ///
+    /// Device pointers must still be valid.
+    pub unsafe fn receive_challenge(
+        &mut self,
+        eval_size: usize,
+        var_idx: usize,
+        r_limbs_per_instance: &[[u32; 3]],
+    ) -> bool {
+        if r_limbs_per_instance.len() != self.n_instances {
+            return false;
+        }
+
+        if var_idx == 0 {
+            // First-round path: per-instance lane-sequential. The base-
+            // field init_v optimization isn't supported in the batched
+            // kernel (yet); follow-up work to extend the kernel.
+            for i in 0..self.n_instances {
+                if cuda_memcpy_h2d(
+                    self.d_challenge as *mut std::ffi::c_void,
+                    r_limbs_per_instance[i].as_ptr() as *const std::ffi::c_void,
+                    3 * 4,
+                ) != 0
+                {
+                    return false;
+                }
+                let inst_ext3_off = i * self.pack_size * self.lane_stride_ext3;
+                let inst_base_off = i * self.pack_size * self.lane_stride_base;
+                for lane in 0..self.pack_size {
+                    let f_ptr = self
+                        .d_bk_f
+                        .add(inst_ext3_off + lane * self.lane_stride_ext3);
+                    let hg_ptr = self
+                        .d_bk_hg
+                        .add(inst_ext3_off + lane * self.lane_stride_ext3);
+                    let init_v_ptr = self
+                        .d_init_v
+                        .add(inst_base_off + lane * self.lane_stride_base)
+                        as *const u32;
+
+                    let err = cuda_ffi::cuda_m31ext3_receive_challenge(
+                        f_ptr,
+                        hg_ptr,
+                        self.d_challenge as *const u32,
+                        eval_size as u32,
+                        1,
+                        init_v_ptr,
+                    );
+                    if err != 0 {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+
+        // Non-first round: replicate r across the pack and dispatch one
+        // batched kernel call.
+        let total_batch = self.total_batch();
+        let mut replicated = vec![0u32; total_batch * 3];
+        for i in 0..self.n_instances {
+            for lane in 0..self.pack_size {
+                let off = (i * self.pack_size + lane) * 3;
+                replicated[off..off + 3].copy_from_slice(&r_limbs_per_instance[i]);
+            }
+        }
+        if cuda_memcpy_h2d(
+            self.d_challenge as *mut std::ffi::c_void,
+            replicated.as_ptr() as *const std::ffi::c_void,
+            total_batch * 3 * 4,
+        ) != 0
+        {
+            return false;
+        }
+
+        let err = cuda_ffi::cuda_m31ext3_receive_challenge_batched(
+            self.d_bk_f,
+            self.d_bk_hg,
+            self.d_challenge as *const u32,
+            eval_size as u32,
+            total_batch as u32,
+            self.lane_stride_ext3 as u32,
+        );
+        err == 0
+    }
+
+    /// Download instance `i`'s `bk_f` from device and convert AoS → SoA
+    /// back into the host buffer at `dst`. Used for CPU fallback when
+    /// `eval_size` drops below `GPU_DISPATCH_THRESHOLD` mid-prove.
+    ///
+    /// # Safety
+    ///
+    /// `dst` must point to at least `num_elems` M31Ext3x16 values for
+    /// instance `i`. Instance index must be in `[0, n_instances)`.
+    pub unsafe fn download_instance_bk_f(
+        &self,
+        instance: usize,
+        dst: *mut u32,
+        num_elems: usize,
+    ) -> bool {
+        if instance >= self.n_instances {
+            return false;
+        }
+        let inst_off = instance * self.pack_size * self.lane_stride_ext3;
+        let src = self.d_bk_f.add(inst_off) as *const u32;
+
+        let total_u32 = self.pack_size * num_elems * 3;
+        let mut host_aos = vec![0u32; total_u32];
+        if cuda_memcpy_d2h(
+            host_aos.as_mut_ptr() as *mut std::ffi::c_void,
+            src as *const std::ffi::c_void,
+            total_u32 * 4,
+        ) != 0
+        {
+            return false;
+        }
+
+        convert_aos_to_simd_ext3(host_aos.as_ptr(), dst, num_elems, self.pack_size);
+        true
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for BatchedGpuSumcheckContext {
+    fn drop(&mut self) {
+        unsafe {
+            cuda_free(self.d_bk_f as *mut std::ffi::c_void);
+            cuda_free(self.d_bk_hg as *mut std::ffi::c_void);
+            cuda_free(self.d_init_v as *mut std::ffi::c_void);
+            cuda_free(self.d_challenge as *mut std::ffi::c_void);
+            cuda_free(self.d_result as *mut std::ffi::c_void);
+        }
+    }
+}
