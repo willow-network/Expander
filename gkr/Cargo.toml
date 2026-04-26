@@ -41,6 +41,7 @@ default = []
 grinding = [ ]
 recursion = [ "transcript/recursion" ]
 profile = [ "utils/profile", "sumcheck/profile" ]
+cuda = [ "sumcheck/cuda", "poly_commit/cuda" ]
 
 [[bench]]
 name = "gkr-hashes"
