@@ -311,6 +311,12 @@ pub struct GpuSumcheckContext {
     d_bk_f: *mut u32,
     /// Bookkeeping table for hg polynomial (M31Ext3, AoS, per-lane).
     d_bk_hg: *mut u32,
+    /// Ping-pong output buffers for `receive_challenge`. Same size as
+    /// `d_bk_f`/`d_bk_hg`. After each non-first-round receive_challenge
+    /// kernel call, `swap()` is called so the freshly-written buffers
+    /// become the next round's input.
+    d_bk_f_alt: *mut u32,
+    d_bk_hg_alt: *mut u32,
     /// Initial input values for first-round receive_challenge (M31 base, AoS, per-lane).
     d_init_v: *mut u32,
     /// Small buffer for the challenge scalar (3 u32 = one M31Ext3).
@@ -375,6 +381,9 @@ impl GpuSumcheckContext {
 
         let d_bk_f = DevicePtr::alloc(ext3_bytes)?;
         let d_bk_hg = DevicePtr::alloc(ext3_bytes)?;
+        // Ping-pong output for receive_challenge. Same size as bk_f / bk_hg.
+        let d_bk_f_alt = DevicePtr::alloc(ext3_bytes)?;
+        let d_bk_hg_alt = DevicePtr::alloc(ext3_bytes)?;
         let d_init_v = DevicePtr::alloc(base_bytes)?;
         // d_challenge holds the (replicated) per-lane challenge for the
         // batched receive_challenge dispatch: pack_size * 3 u32.
@@ -397,6 +406,8 @@ impl GpuSumcheckContext {
         Some(GpuSumcheckContext {
             d_bk_f: d_bk_f.into_raw(),
             d_bk_hg: d_bk_hg.into_raw(),
+            d_bk_f_alt: d_bk_f_alt.into_raw(),
+            d_bk_hg_alt: d_bk_hg_alt.into_raw(),
             d_init_v: d_init_v.into_raw(),
             d_challenge: d_challenge.into_raw(),
             d_result: d_result.into_raw(),
@@ -526,14 +537,25 @@ impl GpuSumcheckContext {
         }
 
         let err = cuda_ffi::cuda_m31ext3_receive_challenge_batched(
-            self.d_bk_f,
-            self.d_bk_hg,
+            self.d_bk_f as *const u32,
+            self.d_bk_hg as *const u32,
+            self.d_bk_f_alt,
+            self.d_bk_hg_alt,
             self.d_challenge as *const u32,
             eval_size as u32,
             self.pack_size as u32,
             self.lane_stride_ext3 as u32,
         );
-        err == 0
+        if err != 0 {
+            return false;
+        }
+        // Ping-pong: the freshly-written buffers become the next round's
+        // input. The kernel guarantees no aliasing between input and
+        // output, so subsequent poly_eval reads from `d_bk_f` (now the
+        // new data) cleanly.
+        std::mem::swap(&mut self.d_bk_f, &mut self.d_bk_f_alt);
+        std::mem::swap(&mut self.d_bk_hg, &mut self.d_bk_hg_alt);
+        true
     }
 
     /// Download `bk_f` from device and convert AoS → SoA back into host memory.
@@ -589,6 +611,8 @@ impl Drop for GpuSumcheckContext {
         unsafe {
             cuda_free(self.d_bk_f as *mut std::ffi::c_void);
             cuda_free(self.d_bk_hg as *mut std::ffi::c_void);
+            cuda_free(self.d_bk_f_alt as *mut std::ffi::c_void);
+            cuda_free(self.d_bk_hg_alt as *mut std::ffi::c_void);
             cuda_free(self.d_init_v as *mut std::ffi::c_void);
             cuda_free(self.d_challenge as *mut std::ffi::c_void);
             cuda_free(self.d_result as *mut std::ffi::c_void);
@@ -624,6 +648,10 @@ pub struct BatchedGpuSumcheckContext {
     d_bk_f: *mut u32,
     /// Same shape for hg.
     d_bk_hg: *mut u32,
+    /// Ping-pong output buffers for receive_challenge — same architecture
+    /// as GpuSumcheckContext (race-free non-in-place kernel write).
+    d_bk_f_alt: *mut u32,
+    d_bk_hg_alt: *mut u32,
     /// Same shape but base field (1 u32 per element per lane).
     d_init_v: *mut u32,
     /// Per-lane challenge buffer: `n_instances * pack_size * 3` u32.
@@ -707,6 +735,8 @@ impl BatchedGpuSumcheckContext {
         // Allocate.
         let d_bk_f = DevicePtr::alloc(ext3_bytes)?;
         let d_bk_hg = DevicePtr::alloc(ext3_bytes)?;
+        let d_bk_f_alt = DevicePtr::alloc(ext3_bytes)?;
+        let d_bk_hg_alt = DevicePtr::alloc(ext3_bytes)?;
         let d_init_v = DevicePtr::alloc(base_bytes)?;
         let d_challenge = DevicePtr::alloc(n_instances * pack_size * 3 * 4)?;
         let d_result = DevicePtr::alloc(n_instances * pack_size * 9 * 4)?;
@@ -725,6 +755,8 @@ impl BatchedGpuSumcheckContext {
         Some(BatchedGpuSumcheckContext {
             d_bk_f: d_bk_f.into_raw(),
             d_bk_hg: d_bk_hg.into_raw(),
+            d_bk_f_alt: d_bk_f_alt.into_raw(),
+            d_bk_hg_alt: d_bk_hg_alt.into_raw(),
             d_init_v: d_init_v.into_raw(),
             d_challenge: d_challenge.into_raw(),
             d_result: d_result.into_raw(),
@@ -882,14 +914,21 @@ impl BatchedGpuSumcheckContext {
         }
 
         let err = cuda_ffi::cuda_m31ext3_receive_challenge_batched(
-            self.d_bk_f,
-            self.d_bk_hg,
+            self.d_bk_f as *const u32,
+            self.d_bk_hg as *const u32,
+            self.d_bk_f_alt,
+            self.d_bk_hg_alt,
             self.d_challenge as *const u32,
             eval_size as u32,
             total_batch as u32,
             self.lane_stride_ext3 as u32,
         );
-        err == 0
+        if err != 0 {
+            return false;
+        }
+        std::mem::swap(&mut self.d_bk_f, &mut self.d_bk_f_alt);
+        std::mem::swap(&mut self.d_bk_hg, &mut self.d_bk_hg_alt);
+        true
     }
 
     /// Download instance `i`'s `bk_f` from device and convert AoS → SoA
@@ -934,6 +973,8 @@ impl Drop for BatchedGpuSumcheckContext {
         unsafe {
             cuda_free(self.d_bk_f as *mut std::ffi::c_void);
             cuda_free(self.d_bk_hg as *mut std::ffi::c_void);
+            cuda_free(self.d_bk_f_alt as *mut std::ffi::c_void);
+            cuda_free(self.d_bk_hg_alt as *mut std::ffi::c_void);
             cuda_free(self.d_init_v as *mut std::ffi::c_void);
             cuda_free(self.d_challenge as *mut std::ffi::c_void);
             cuda_free(self.d_result as *mut std::ffi::c_void);

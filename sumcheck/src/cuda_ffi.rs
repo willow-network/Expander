@@ -70,10 +70,19 @@ extern "C" {
     /// dispatch with a SHARED challenge across lanes, callers replicate
     /// the same `r` `batch_size` times into `d_challenge_r`.
     ///
+    /// Writes go to `d_bk_f_out` / `d_bk_hg_out`, NOT in-place. Earlier
+    /// versions wrote in-place which had a cross-block read-write race
+    /// (block `n+1`'s writes landing in block `n`'s read region depending
+    /// on grid scheduling). With separate output buffers, the kernel is
+    /// deterministic across grid sizes. Callers ping-pong the input/output
+    /// pair on each round.
+    ///
     /// Returns 0 on success.
     pub fn cuda_m31ext3_receive_challenge_batched(
-        d_bk_f: *mut u32,
-        d_bk_hg: *mut u32,
+        d_bk_f: *const u32,
+        d_bk_hg: *const u32,
+        d_bk_f_out: *mut u32,
+        d_bk_hg_out: *mut u32,
         d_challenge_r: *const u32,
         eval_size: u32,
         batch_size: u32,

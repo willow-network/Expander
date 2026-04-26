@@ -163,9 +163,24 @@ __global__ void reduce_blocks_batched(
 
 // Batched receive_challenge: each thread updates one (fold, pair)
 // tuple. Each fold has its own challenge `r[fold]`.
+//
+// Writes go to a SEPARATE output buffer (d_bk_f_out / d_bk_hg_out)
+// from the input buffer (d_bk_f / d_bk_hg). The earlier in-place
+// version had a cross-block read-write race: thread i reads at
+// `6i..6i+5` and writes at `3i..3i+2`, so block N+1's writes could
+// land in block N's read region depending on grid scheduling. With
+// separate buffers, no overlap is possible and the kernel is
+// deterministic across grid sizes.
+//
+// The host wrapper allocates `d_bk_f_out` of the same size as
+// `d_bk_f` once per context and ping-pongs the pair on each round.
+// The output is only `3*eval_size` u32 per fold, so the upper half
+// of the output buffer is unused but harmless.
 __global__ void receive_challenge_kernel_batched(
-    uint32_t* __restrict__ d_bk_f,
-    uint32_t* __restrict__ d_bk_hg,
+    const uint32_t* __restrict__ d_bk_f,
+    const uint32_t* __restrict__ d_bk_hg,
+    uint32_t* __restrict__ d_bk_f_out,
+    uint32_t* __restrict__ d_bk_hg_out,
     const uint32_t* __restrict__ d_r,   // [batch][3 u32]
     uint32_t eval_size,
     uint32_t fold_stride_u32
@@ -179,39 +194,41 @@ __global__ void receive_challenge_kernel_batched(
     r.v[1] = d_r[fold * 3 + 1];
     r.v[2] = d_r[fold * 3 + 2];
 
-    uint32_t* fold_f = d_bk_f + fold * fold_stride_u32;
-    uint32_t* fold_hg = d_bk_hg + fold * fold_stride_u32;
+    const uint32_t* fold_f_in = d_bk_f + fold * fold_stride_u32;
+    const uint32_t* fold_hg_in = d_bk_hg + fold * fold_stride_u32;
+    uint32_t* fold_f_out = d_bk_f_out + fold * fold_stride_u32;
+    uint32_t* fold_hg_out = d_bk_hg_out + fold * fold_stride_u32;
 
     {
         int base = i * 6;
         M31ext3 f0, f1;
-        f0.v[0] = fold_f[base + 0]; f0.v[1] = fold_f[base + 1]; f0.v[2] = fold_f[base + 2];
-        f1.v[0] = fold_f[base + 3]; f1.v[1] = fold_f[base + 4]; f1.v[2] = fold_f[base + 5];
+        f0.v[0] = fold_f_in[base + 0]; f0.v[1] = fold_f_in[base + 1]; f0.v[2] = fold_f_in[base + 2];
+        f1.v[0] = fold_f_in[base + 3]; f1.v[1] = fold_f_in[base + 4]; f1.v[2] = fold_f_in[base + 5];
 
         M31ext3 diff = m31ext3_sub(f1, f0);
         M31ext3 scaled = m31ext3_mul(diff, r);
         M31ext3 result = m31ext3_add(f0, scaled);
 
         int out = i * 3;
-        fold_f[out + 0] = result.v[0];
-        fold_f[out + 1] = result.v[1];
-        fold_f[out + 2] = result.v[2];
+        fold_f_out[out + 0] = result.v[0];
+        fold_f_out[out + 1] = result.v[1];
+        fold_f_out[out + 2] = result.v[2];
     }
 
     {
         int base = i * 6;
         M31ext3 h0, h1;
-        h0.v[0] = fold_hg[base + 0]; h0.v[1] = fold_hg[base + 1]; h0.v[2] = fold_hg[base + 2];
-        h1.v[0] = fold_hg[base + 3]; h1.v[1] = fold_hg[base + 4]; h1.v[2] = fold_hg[base + 5];
+        h0.v[0] = fold_hg_in[base + 0]; h0.v[1] = fold_hg_in[base + 1]; h0.v[2] = fold_hg_in[base + 2];
+        h1.v[0] = fold_hg_in[base + 3]; h1.v[1] = fold_hg_in[base + 4]; h1.v[2] = fold_hg_in[base + 5];
 
         M31ext3 diff = m31ext3_sub(h1, h0);
         M31ext3 scaled = m31ext3_mul(diff, r);
         M31ext3 result = m31ext3_add(h0, scaled);
 
         int out = i * 3;
-        fold_hg[out + 0] = result.v[0];
-        fold_hg[out + 1] = result.v[1];
-        fold_hg[out + 2] = result.v[2];
+        fold_hg_out[out + 0] = result.v[0];
+        fold_hg_out[out + 1] = result.v[1];
+        fold_hg_out[out + 2] = result.v[2];
     }
 }
 
@@ -294,8 +311,10 @@ extern "C" int cuda_m31ext3_poly_eval_batched(
 }
 
 extern "C" int cuda_m31ext3_receive_challenge_batched(
-    uint32_t* d_bk_f,
-    uint32_t* d_bk_hg,
+    const uint32_t* d_bk_f,
+    const uint32_t* d_bk_hg,
+    uint32_t* d_bk_f_out,
+    uint32_t* d_bk_hg_out,
     const uint32_t* d_challenge_r,  // [batch][3 u32]
     uint32_t eval_size,
     uint32_t batch_size,
@@ -306,7 +325,7 @@ extern "C" int cuda_m31ext3_receive_challenge_batched(
 
     dim3 grid(blocks_per_fold, batch_size);
     receive_challenge_kernel_batched<<<grid, block_size>>>(
-        d_bk_f, d_bk_hg, d_challenge_r, eval_size, fold_stride_u32
+        d_bk_f, d_bk_hg, d_bk_f_out, d_bk_hg_out, d_challenge_r, eval_size, fold_stride_u32
     );
     cudaError_t err = cudaGetLastError();
     return (err == cudaSuccess) ? 0 : (int)err;
