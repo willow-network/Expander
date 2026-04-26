@@ -940,3 +940,140 @@ impl Drop for BatchedGpuSumcheckContext {
         }
     }
 }
+
+#[cfg(all(test, feature = "cuda"))]
+mod batched_correctness_tests {
+    use super::*;
+
+    /// Build synthetic SoA-x16 inputs for one instance, deterministic per seed.
+    /// Returns (hg_soa, init_v_soa) of shape required by GpuSumcheckContext::new:
+    ///   hg_soa: input_size * 48 u32 (M31Ext3x16, SoA)
+    ///   init_v_soa: input_size * 16 u32 (M31x16, SoA)
+    fn make_instance_inputs(input_size: usize, pack_size: usize, seed: u64) -> (Vec<u32>, Vec<u32>) {
+        let mut hg = vec![0u32; input_size * pack_size * 3];
+        let mut init_v = vec![0u32; input_size * pack_size];
+        // Cheap LCG instead of pulling rand into the dev-deps just for this.
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            // Top 31 bits, masked to fit M31 prime (2^31 - 1).
+            ((state >> 33) as u32) & 0x7FFF_FFFF
+        };
+        for v in hg.iter_mut() {
+            *v = next();
+        }
+        for v in init_v.iter_mut() {
+            *v = next();
+        }
+        (hg, init_v)
+    }
+
+    /// poly_eval_at output from the batched context must be bit-exact with
+    /// running each instance through GpuSumcheckContext separately.
+    #[test]
+    fn batched_poly_eval_matches_per_instance() {
+        const N_INSTANCES: usize = 3;
+        const PACK_SIZE: usize = 16;
+        const INPUT_SIZE: usize = 4096; // ≥ GPU_DISPATCH_THRESHOLD
+        const EVAL_SIZE: usize = 2048; // first round halves input_size
+
+        let mut instance_inputs = Vec::with_capacity(N_INSTANCES);
+        for i in 0..N_INSTANCES {
+            instance_inputs.push(make_instance_inputs(INPUT_SIZE, PACK_SIZE, 0xC0DE + i as u64));
+        }
+
+        // Single-instance dispatch: build one GpuSumcheckContext per instance,
+        // call poly_eval_at, capture 16-lane result.
+        let mut single_results = Vec::with_capacity(N_INSTANCES);
+        for (hg, init_v) in &instance_inputs {
+            let ctx = unsafe {
+                GpuSumcheckContext::new(hg.as_ptr(), init_v.as_ptr(), PACK_SIZE, INPUT_SIZE)
+            }
+            .expect("GpuSumcheckContext::new");
+            let res = unsafe { ctx.poly_eval_at(EVAL_SIZE) }.expect("single poly_eval_at");
+            single_results.push(res);
+        }
+
+        // Batched dispatch: build one BatchedGpuSumcheckContext for all N,
+        // call poly_eval_at once, get Vec of 16-lane results.
+        let hg_ptrs: Vec<*const u32> = instance_inputs.iter().map(|(h, _)| h.as_ptr()).collect();
+        let init_v_ptrs: Vec<*const u32> =
+            instance_inputs.iter().map(|(_, v)| v.as_ptr()).collect();
+        let batched = unsafe {
+            BatchedGpuSumcheckContext::new(&hg_ptrs, &init_v_ptrs, PACK_SIZE, INPUT_SIZE)
+        }
+        .expect("BatchedGpuSumcheckContext::new");
+        let batched_results =
+            unsafe { batched.poly_eval_at(EVAL_SIZE) }.expect("batched poly_eval_at");
+
+        assert_eq!(batched_results.len(), N_INSTANCES);
+        for i in 0..N_INSTANCES {
+            for lane in 0..PACK_SIZE {
+                assert_eq!(
+                    batched_results[i][lane], single_results[i][lane],
+                    "instance {i} lane {lane} mismatch: \
+                     batched={:?} vs single={:?}",
+                    batched_results[i][lane], single_results[i][lane]
+                );
+            }
+        }
+    }
+
+    /// receive_challenge then poly_eval_at must also match between
+    /// single-instance and batched paths. Uses var_idx=1 (non-first
+    /// round) so we exercise the batched receive_challenge dispatch.
+    #[test]
+    fn batched_receive_challenge_matches_per_instance() {
+        const N_INSTANCES: usize = 3;
+        const PACK_SIZE: usize = 16;
+        const INPUT_SIZE: usize = 4096;
+        const EVAL_SIZE: usize = 2048;
+
+        let mut instance_inputs = Vec::with_capacity(N_INSTANCES);
+        for i in 0..N_INSTANCES {
+            instance_inputs.push(make_instance_inputs(INPUT_SIZE, PACK_SIZE, 0xBEEF + i as u64));
+        }
+        // Different challenge per instance (mirroring per-transcript divergence).
+        let r_per_instance: Vec<[u32; 3]> = (0..N_INSTANCES)
+            .map(|i| [0x1111_1111 + i as u32, 0x2222_2222 - i as u32, 0x3333_3333])
+            .collect();
+
+        // Single path.
+        let mut single_post_results = Vec::with_capacity(N_INSTANCES);
+        for (i, (hg, init_v)) in instance_inputs.iter().enumerate() {
+            let mut ctx = unsafe {
+                GpuSumcheckContext::new(hg.as_ptr(), init_v.as_ptr(), PACK_SIZE, INPUT_SIZE)
+            }
+            .expect("GpuSumcheckContext::new");
+            let ok =
+                unsafe { ctx.receive_challenge(EVAL_SIZE / 2, 1, &r_per_instance[i]) };
+            assert!(ok, "single receive_challenge instance {i}");
+            let res =
+                unsafe { ctx.poly_eval_at(EVAL_SIZE / 4) }.expect("single poly_eval_at post-rc");
+            single_post_results.push(res);
+        }
+
+        // Batched path.
+        let hg_ptrs: Vec<*const u32> = instance_inputs.iter().map(|(h, _)| h.as_ptr()).collect();
+        let init_v_ptrs: Vec<*const u32> =
+            instance_inputs.iter().map(|(_, v)| v.as_ptr()).collect();
+        let mut batched = unsafe {
+            BatchedGpuSumcheckContext::new(&hg_ptrs, &init_v_ptrs, PACK_SIZE, INPUT_SIZE)
+        }
+        .expect("BatchedGpuSumcheckContext::new");
+        let ok = unsafe { batched.receive_challenge(EVAL_SIZE / 2, 1, &r_per_instance) };
+        assert!(ok, "batched receive_challenge");
+        let batched_post = unsafe { batched.poly_eval_at(EVAL_SIZE / 4) }
+            .expect("batched poly_eval_at post-rc");
+
+        assert_eq!(batched_post.len(), N_INSTANCES);
+        for i in 0..N_INSTANCES {
+            for lane in 0..PACK_SIZE {
+                assert_eq!(
+                    batched_post[i][lane], single_post_results[i][lane],
+                    "post-receive_challenge mismatch at instance {i} lane {lane}"
+                );
+            }
+        }
+    }
+}
