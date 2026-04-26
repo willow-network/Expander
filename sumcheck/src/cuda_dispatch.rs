@@ -376,8 +376,11 @@ impl GpuSumcheckContext {
         let d_bk_f = DevicePtr::alloc(ext3_bytes)?;
         let d_bk_hg = DevicePtr::alloc(ext3_bytes)?;
         let d_init_v = DevicePtr::alloc(base_bytes)?;
-        let d_challenge = DevicePtr::alloc(3 * 4)?;
-        let d_result = DevicePtr::alloc(9 * 4)?;
+        // d_challenge holds the (replicated) per-lane challenge for the
+        // batched receive_challenge dispatch: pack_size * 3 u32.
+        let d_challenge = DevicePtr::alloc(pack_size * 3 * 4)?;
+        // d_result holds the batched poly_eval output: pack_size * 9 u32.
+        let d_result = DevicePtr::alloc(pack_size * 9 * 4)?;
 
         // ---- Upload ----
 
@@ -414,6 +417,12 @@ impl GpuSumcheckContext {
     /// Returns `result[lane] = [p0_l0, p0_l1, p0_l2, p1_l0, …, p2_l2]`
     /// (9 u32 per lane: 3 limbs × 3 polynomial components).
     ///
+    /// Implementation: a single batched kernel dispatch with the SIMD
+    /// pack treated as the batch dimension. Replaces the legacy
+    /// lane-sequential loop, which paid the ~10–50 µs CUDA launch
+    /// overhead 16× per round and left the GPU at ~1% utilization.
+    /// One batched dispatch + one D2H copy of `pack_size * 9 u32`.
+    ///
     /// # Safety
     ///
     /// Device pointers must still be valid (context not dropped).
@@ -421,30 +430,46 @@ impl GpuSumcheckContext {
         debug_assert!(self.pack_size <= 16);
         let mut results = [[0u32; 9]; 16];
 
+        let err = cuda_ffi::cuda_m31ext3_poly_eval_batched(
+            self.d_bk_f as *const u32,
+            self.d_bk_hg as *const u32,
+            self.d_result,
+            eval_size as u32,
+            self.pack_size as u32,
+            self.lane_stride_ext3 as u32,
+        );
+        if err != 0 {
+            return None;
+        }
+
+        // Single D2H copy of the whole batched result block.
+        let mut packed = vec![0u32; self.pack_size * 9];
+        if cuda_memcpy_d2h(
+            packed.as_mut_ptr() as *mut std::ffi::c_void,
+            self.d_result as *const std::ffi::c_void,
+            self.pack_size * 9 * 4,
+        ) != 0
+        {
+            return None;
+        }
         for lane in 0..self.pack_size {
-            let f_ptr = self.d_bk_f.add(lane * self.lane_stride_ext3) as *const u32;
-            let hg_ptr = self.d_bk_hg.add(lane * self.lane_stride_ext3) as *const u32;
-
-            let err =
-                cuda_ffi::cuda_m31ext3_poly_eval(f_ptr, hg_ptr, self.d_result, eval_size as u32);
-            if err != 0 {
-                return None;
-            }
-
-            if cuda_memcpy_d2h(
-                results[lane].as_mut_ptr() as *mut std::ffi::c_void,
-                self.d_result as *const std::ffi::c_void,
-                9 * 4,
-            ) != 0
-            {
-                return None;
-            }
+            results[lane].copy_from_slice(&packed[lane * 9..lane * 9 + 9]);
         }
 
         Some(results)
     }
 
     /// Run `receive_challenge` on GPU for all SIMD lanes.
+    ///
+    /// Non-first rounds use a single batched kernel dispatch with the
+    /// challenge `r` replicated across `pack_size` lanes. First round
+    /// (`var_idx == 0`) reads from `init_v` (M31 base field) for an
+    /// optimization where the first multiplication is base*ext3 instead
+    /// of ext3*ext3 — that path needs the per-lane variant and the
+    /// batched kernel doesn't support base-field input yet, so first
+    /// round falls back to the lane-sequential path. First round
+    /// happens once per phase out of log_n rounds, so the bulk of the
+    /// dispatches still benefit from batching.
     ///
     /// # Safety
     ///
@@ -455,37 +480,60 @@ impl GpuSumcheckContext {
         var_idx: usize,
         r_limbs: &[u32; 3],
     ) -> bool {
-        // Upload the scalar challenge (shared across all lanes).
+        if var_idx == 0 {
+            // First-round path: lane-sequential with init_v.
+            // Upload r once; the kernel reads it as a single 3-u32 value.
+            if cuda_memcpy_h2d(
+                self.d_challenge as *mut std::ffi::c_void,
+                r_limbs.as_ptr() as *const std::ffi::c_void,
+                3 * 4,
+            ) != 0
+            {
+                return false;
+            }
+            for lane in 0..self.pack_size {
+                let f_ptr = self.d_bk_f.add(lane * self.lane_stride_ext3);
+                let hg_ptr = self.d_bk_hg.add(lane * self.lane_stride_ext3);
+                let init_v_ptr = self.d_init_v.add(lane * self.lane_stride_base) as *const u32;
+
+                let err = cuda_ffi::cuda_m31ext3_receive_challenge(
+                    f_ptr,
+                    hg_ptr,
+                    self.d_challenge as *const u32,
+                    eval_size as u32,
+                    1,
+                    init_v_ptr,
+                );
+                if err != 0 {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // Non-first round: batched dispatch with replicated r.
+        let mut replicated = vec![0u32; self.pack_size * 3];
+        for lane in 0..self.pack_size {
+            replicated[lane * 3..lane * 3 + 3].copy_from_slice(r_limbs);
+        }
         if cuda_memcpy_h2d(
             self.d_challenge as *mut std::ffi::c_void,
-            r_limbs.as_ptr() as *const std::ffi::c_void,
-            3 * 4,
+            replicated.as_ptr() as *const std::ffi::c_void,
+            self.pack_size * 3 * 4,
         ) != 0
         {
             return false;
         }
 
-        let first_round: i32 = if var_idx == 0 { 1 } else { 0 };
-
-        for lane in 0..self.pack_size {
-            let f_ptr = self.d_bk_f.add(lane * self.lane_stride_ext3);
-            let hg_ptr = self.d_bk_hg.add(lane * self.lane_stride_ext3);
-            let init_v_ptr = self.d_init_v.add(lane * self.lane_stride_base) as *const u32;
-
-            let err = cuda_ffi::cuda_m31ext3_receive_challenge(
-                f_ptr,
-                hg_ptr,
-                self.d_challenge as *const u32,
-                eval_size as u32,
-                first_round,
-                init_v_ptr,
-            );
-            if err != 0 {
-                return false;
-            }
-        }
-
-        true
+        let err = cuda_ffi::cuda_m31ext3_receive_challenge_batched(
+            self.d_bk_f,
+            self.d_bk_hg,
+            self.d_challenge as *const u32,
+            eval_size as u32,
+            self.pack_size as u32,
+            self.lane_stride_ext3 as u32,
+        );
+        err == 0
     }
 
     /// Download `bk_f` from device and convert AoS → SoA back into host memory.

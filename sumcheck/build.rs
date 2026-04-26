@@ -30,6 +30,7 @@ fn main() {
 
             build
                 .file("cuda_m31/m31_sumcheck.cu")
+                .file("cuda_m31/m31_sumcheck_batched.cu")
                 .compile("sumcheck_cuda_m31");
 
             println!("cargo:rustc-cfg=feature=\"cuda\"");

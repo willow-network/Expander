@@ -42,4 +42,41 @@ extern "C" {
         first_round: i32,
         d_init_v: *const u32,
     ) -> i32;
+
+    /// Batched poly_eval: processes `batch_size` independent fold instances
+    /// in a single kernel dispatch. Buffers are AoS (per-fold contiguous).
+    /// `fold_stride_u32` is the per-fold u32 count in the original
+    /// allocation — stays constant across rounds even as `eval_size`
+    /// halves, so the kernel computes the right per-fold offset.
+    /// Result is `batch_size * 9 u32`.
+    ///
+    /// For sumcheck SIMD-pack dispatch, set `batch_size = pack_size` and
+    /// `fold_stride_u32 = lane_stride_ext3`. The 16 SIMD lanes are
+    /// processed concurrently in one kernel launch instead of 16
+    /// separate launches.
+    ///
+    /// Returns 0 on success.
+    pub fn cuda_m31ext3_poly_eval_batched(
+        d_bk_f: *const u32,
+        d_bk_hg: *const u32,
+        d_result: *mut u32,
+        eval_size: u32,
+        batch_size: u32,
+        fold_stride_u32: u32,
+    ) -> i32;
+
+    /// Batched receive_challenge: each fold has its own `r` (3 u32);
+    /// `d_challenge_r` is `batch_size * 3 u32` total. For SIMD-pack
+    /// dispatch with a SHARED challenge across lanes, callers replicate
+    /// the same `r` `batch_size` times into `d_challenge_r`.
+    ///
+    /// Returns 0 on success.
+    pub fn cuda_m31ext3_receive_challenge_batched(
+        d_bk_f: *mut u32,
+        d_bk_hg: *mut u32,
+        d_challenge_r: *const u32,
+        eval_size: u32,
+        batch_size: u32,
+        fold_stride_u32: u32,
+    ) -> i32;
 }
