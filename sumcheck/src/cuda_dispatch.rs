@@ -949,17 +949,65 @@ impl BatchedGpuSumcheckContext {
             return false;
         }
         let inst_off = instance * self.pack_size * self.lane_stride_ext3;
-        let src = self.d_bk_f.add(inst_off) as *const u32;
+        self.download_instance_ext3(self.d_bk_f.add(inst_off) as *const u32, dst, num_elems)
+    }
 
-        let total_u32 = self.pack_size * num_elems * 3;
-        let mut host_aos = vec![0u32; total_u32];
-        if cuda_memcpy_d2h(
-            host_aos.as_mut_ptr() as *mut std::ffi::c_void,
-            src as *const std::ffi::c_void,
-            total_u32 * 4,
-        ) != 0
-        {
+    /// Download instance `instance`'s `bk_hg` (M31Ext3, post-fold) from
+    /// device back into the host buffer at `dst`. Required alongside
+    /// `download_instance_bk_f` for the GPU→CPU transition: when the
+    /// CPU helper resumes (`xy_helper.poly_eval_at` etc.), it reads
+    /// both `v_evals` and `hg_evals`, so both must be current on host.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as `download_instance_bk_f`.
+    pub unsafe fn download_instance_bk_hg(
+        &self,
+        instance: usize,
+        dst: *mut u32,
+        num_elems: usize,
+    ) -> bool {
+        if instance >= self.n_instances {
             return false;
+        }
+        let inst_off = instance * self.pack_size * self.lane_stride_ext3;
+        self.download_instance_ext3(self.d_bk_hg.add(inst_off) as *const u32, dst, num_elems)
+    }
+
+    /// Per-instance equivalent of `GpuSumcheckContext::download_ext3_buffer`.
+    /// `d_src_inst` already points at the start of the target instance's
+    /// region in the AoS device buffer (`pack_size` lanes laid back-to-back,
+    /// each `lane_stride_ext3` u32 long).
+    ///
+    /// We do per-lane memcpys so we read only the active `num_elems * 3`
+    /// u32 per lane and skip the unused [num_elems..lane_stride_ext3/3]
+    /// tail. A single big memcpy of `pack_size * num_elems * 3` u32
+    /// would mash those tails into the host AoS layout and produce
+    /// wrong values after AoS→SoA conversion — that's the bug that
+    /// caused single-vs-batched divergence after the GPU→CPU
+    /// transition on layers whose initial eval_size hits exactly
+    /// `GPU_DISPATCH_THRESHOLD`.
+    unsafe fn download_instance_ext3(
+        &self,
+        d_src_inst: *const u32,
+        dst: *mut u32,
+        num_elems: usize,
+    ) -> bool {
+        let per_lane_u32 = num_elems * 3;
+        let total_u32 = self.pack_size * per_lane_u32;
+        let mut host_aos = vec![0u32; total_u32];
+
+        for lane in 0..self.pack_size {
+            let src_offset = lane * self.lane_stride_ext3;
+            let dst_offset = lane * per_lane_u32;
+            if cuda_memcpy_d2h(
+                host_aos.as_mut_ptr().add(dst_offset) as *mut std::ffi::c_void,
+                d_src_inst.add(src_offset) as *const std::ffi::c_void,
+                per_lane_u32 * 4,
+            ) != 0
+            {
+                return false;
+            }
         }
 
         convert_aos_to_simd_ext3(host_aos.as_ptr(), dst, num_elems, self.pack_size);
