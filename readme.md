@@ -1,3 +1,7 @@
+> **Fork notice**: This is [Willow](https://github.com/willow-network/willow)'s
+> fork of [PolyhedraZK/Expander](https://github.com/PolyhedraZK/Expander).
+> See [FORK.md](./FORK.md) for the list of deviations from upstream.
+
 <div align="center" style="width: 100%;">
   <img 
     src="https://expander.polyhedra.network/assets/static/logo-with-text.16d5af29.svg" 
