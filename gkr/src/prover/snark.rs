@@ -96,10 +96,26 @@ impl<'a, Cfg: GKREngine> Prover<'a, Cfg> {
         let proving_timer = Timer::new("prover", self.mpi_config.is_root());
         let mut transcript = Cfg::TranscriptConfig::new();
 
-        // Bind public input to the FS transcript to prevent malleability attacks
-        if self.mpi_config.is_root() {
-            for v in &c.public_input {
-                transcript.append_field_element(v);
+        // Bind public input to the FS transcript to prevent malleability attacks.
+        // Under MPI, gather the FULL across-ranks public input and bind THAT on
+        // root: the verifier reconstructs the same full vector
+        // (verifier_process_witness), so binding only root's per-rank slice
+        // desyncs the transcript for data-parallel circuits that have per-
+        // instance public inputs. world_size == 1 and empty-public-input
+        // circuits are unaffected (gather is a copy / no-op). [willow: mpi pub-input bind]
+        {
+            let world_size = self.mpi_config.world_size();
+            let per_rank = c.public_input.len();
+            let mut full_public = if self.mpi_config.is_root() && per_rank > 0 {
+                vec![c.public_input[0].clone(); per_rank * world_size]
+            } else {
+                Vec::new()
+            };
+            self.mpi_config.gather_vec(&c.public_input, &mut full_public);
+            if self.mpi_config.is_root() {
+                for v in &full_public {
+                    transcript.append_field_element(v);
+                }
             }
         }
         transcript_root_broadcast(&mut transcript, &self.mpi_config);
